@@ -1,0 +1,85 @@
+seed: 1024
+device: cuda:0
+paths:
+  corpus: data/dataset_corpus.json
+  index: artifacts/index
+  train: data/train.json
+  valid: null
+  output: outputs/run
+llm:
+  base_url: http://127.0.0.1:8000/v1
+  model: Qwen3-14B-AWQ
+  api_key_env: QGRAPHRAG_LLM_API_KEY
+  timeout: 180.0
+  retries: 3
+  temperature: 0.0
+  max_tokens: 4096
+  json_mode: true
+  disable_thinking: true
+  cache_dir: cache/llm
+embedding:
+  model: sentence-transformers/all-mpnet-base-v2
+  batch_size: 32
+  normalize: false
+  device: cpu
+  local_files_only: false
+construction:
+  chunk_chars: 2400
+  overlap_chars: 200
+  workers: 4
+  aliases: null
+model:
+  input_dim: 512
+  hidden_dims:
+  - 512
+  - 512
+  - 512
+  - 512
+  - 512
+  - 512
+  short_cut: true
+  layer_norm: true
+  concat_hidden: false
+  num_mlp_layers: 2
+  quality_hidden_dim: 16
+  edge_chunk_size: 8192
+pretrain:
+  epochs: 10
+  batch_size: 8
+  num_negative: 256
+  adversarial_temperature: 1.0
+  lr: 0.0005
+  weight_decay: 0.01
+  steps_per_epoch: null
+  max_grad_norm: 1.0
+finetune:
+  epochs: 20
+  batch_size: 8
+  lr: 0.0005
+  weight_decay: 0.01
+  adversarial_temperature: 0.2
+  lambda_bce: 0.3
+  lambda_rank: 0.7
+  steps_per_epoch: null
+  max_grad_norm: 1.0
+retrieval:
+  entity_top_k: 100
+  graph_doc_top_k: 10
+  bm25_top_k: 50
+  vector_top_k: 50
+  text_top_k: 10
+  rerank_batch_size: 32
+  reranker: cross-encoder/ms-marco-MiniLM-L-6-v2
+  reranker_device: cpu
+  final_top_k: 5
+  linking_top_k: 1
+  max_supplementation_rounds: 2
+pcst:
+  top_m: 50
+  hops: 2
+  alpha_s: 0.5
+  c_min: 0.05
+  eta: 0.5
+  lambda_pcst: 0.5
+  epsilon: 1.0e-08
+  pruning: gw

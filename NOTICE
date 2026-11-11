@@ -1,0 +1,9 @@
+Q-GraphRAG
+Copyright 2026 Q-GraphRAG authors.
+
+The NBFNet backbone is adapted from GFM-RAG, by Linhao Luo, Zicheng Zhao and contributors,
+and its ULTRA/NBFNet components. GFM-RAG is distributed under the Apache License 2.0.
+https://github.com/RManLuo/gfm-rag
+
+Modifications include quality-weighted propagation, graph-support readout and native
+chunked DistMult aggregation. The Apache License 2.0 is included in LICENSE.

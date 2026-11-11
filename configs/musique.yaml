@@ -1,0 +1,6 @@
+paths:
+  corpus: data/musique/raw/dataset_corpus.json
+  train: data/musique/raw/train.json
+  valid: null
+  index: artifacts/musique/index
+  output: outputs/musique/run

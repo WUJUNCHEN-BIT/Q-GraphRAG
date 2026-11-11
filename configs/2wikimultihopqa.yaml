@@ -1,0 +1,6 @@
+paths:
+  corpus: data/2wikimultihopqa/raw/dataset_corpus.json
+  train: data/2wikimultihopqa/raw/train.json
+  valid: null
+  index: artifacts/2wikimultihopqa/index
+  output: outputs/2wikimultihopqa/run

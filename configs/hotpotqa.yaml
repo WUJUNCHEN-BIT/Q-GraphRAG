@@ -1,0 +1,6 @@
+paths:
+  corpus: data/hotpotqa/raw/dataset_corpus.json
+  train: data/hotpotqa/raw/train.json
+  valid: null
+  index: artifacts/hotpotqa/index
+  output: outputs/hotpotqa/run
