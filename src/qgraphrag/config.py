@@ -13,6 +13,7 @@ import yaml
 DEFAULTS = {
     "seed": 1024,
     "device": "cuda:0",
+    "datasets": {"root": None, "train_names": [], "eval_name": "eval"},
     "paths": {
         "corpus": "data/dataset_corpus.json",
         "index": "artifacts/index",
@@ -52,7 +53,7 @@ DEFAULTS = {
     },
     "pretrain": {
         "epochs": 10,
-        "batch_size": 8,
+        "batch_size": 4,
         "num_negative": 256,
         "adversarial_temperature": 1.0,
         "lr": 0.0005,
@@ -62,7 +63,7 @@ DEFAULTS = {
     },
     "finetune": {
         "epochs": 20,
-        "batch_size": 8,
+        "batch_size": 4,
         "lr": 0.0005,
         "weight_decay": 0.01,
         "adversarial_temperature": 0.2,
@@ -72,20 +73,20 @@ DEFAULTS = {
         "max_grad_norm": 1.0,
     },
     "retrieval": {
-        "entity_top_k": 100,
+        "entity_top_k": 20,
         "graph_doc_top_k": 10,
         "bm25_top_k": 50,
         "vector_top_k": 50,
         "text_top_k": 10,
         "rerank_batch_size": 32,
-        "reranker": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        "reranker": "cross-encoder/ms-marco-MiniLM-L6-v2",
         "reranker_device": "cpu",
         "final_top_k": 5,
         "linking_top_k": 1,
         "max_supplementation_rounds": 2,
     },
     "pcst": {
-        "top_m": 50,
+        "top_m": 5,
         "hops": 2,
         "alpha_s": 0.5,
         "c_min": 0.05,
@@ -142,6 +143,31 @@ def load_config(path: str | Path | None = None, overrides: list[str] | None = No
 
 
 def validate_config(config: dict) -> None:
+    datasets = config["datasets"]
+    names = datasets["train_names"]
+    if (
+        not isinstance(names, list)
+        or any(
+            not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name)
+            for name in names
+        )
+        or len(set(names)) != len(names)
+    ):
+        raise ValueError("datasets.train_names must contain unique graph names")
+    evaluation = datasets["eval_name"]
+    if not isinstance(evaluation, str) or not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9_.-]*", evaluation
+    ):
+        raise ValueError("Invalid datasets.eval_name")
+    if evaluation in names:
+        raise ValueError("The evaluation graph cannot be a training graph")
+    if datasets["root"] is not None:
+        if not isinstance(datasets["root"], str) or not datasets["root"].strip():
+            raise ValueError("datasets.root must be a directory path")
+        if config["paths"]["valid"] is not None:
+            raise ValueError("paths.valid is only supported in single-graph configurations")
+    elif names:
+        raise ValueError("datasets.train_names requires datasets.root")
     chunk = config["construction"]
     if chunk["chunk_chars"] <= 0 or not 0 <= chunk["overlap_chars"] < chunk["chunk_chars"]:
         raise ValueError("Require 0 <= overlap_chars < chunk_chars")

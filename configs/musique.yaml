@@ -1,6 +1,7 @@
+datasets:
+  root: data/musique
+  train_names: [train_0, train_1, train_2, train_3]
+  eval_name: eval
 paths:
-  corpus: data/musique/raw/dataset_corpus.json
-  train: data/musique/raw/train.json
-  valid: null
-  index: artifacts/musique/index
+  index: artifacts/musique
   output: outputs/musique/run

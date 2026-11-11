@@ -1,5 +1,9 @@
 seed: 1024
 device: cuda:0
+datasets:
+  root: null
+  train_names: []
+  eval_name: eval
 paths:
   corpus: data/dataset_corpus.json
   index: artifacts/index
@@ -45,7 +49,7 @@ model:
   edge_chunk_size: 8192
 pretrain:
   epochs: 10
-  batch_size: 8
+  batch_size: 4
   num_negative: 256
   adversarial_temperature: 1.0
   lr: 0.0005
@@ -54,7 +58,7 @@ pretrain:
   max_grad_norm: 1.0
 finetune:
   epochs: 20
-  batch_size: 8
+  batch_size: 4
   lr: 0.0005
   weight_decay: 0.01
   adversarial_temperature: 0.2
@@ -63,19 +67,19 @@ finetune:
   steps_per_epoch: null
   max_grad_norm: 1.0
 retrieval:
-  entity_top_k: 100
+  entity_top_k: 20
   graph_doc_top_k: 10
   bm25_top_k: 50
   vector_top_k: 50
   text_top_k: 10
   rerank_batch_size: 32
-  reranker: cross-encoder/ms-marco-MiniLM-L-6-v2
+  reranker: cross-encoder/ms-marco-MiniLM-L6-v2
   reranker_device: cpu
   final_top_k: 5
   linking_top_k: 1
   max_supplementation_rounds: 2
 pcst:
-  top_m: 50
+  top_m: 5
   hops: 2
   alpha_s: 0.5
   c_min: 0.05

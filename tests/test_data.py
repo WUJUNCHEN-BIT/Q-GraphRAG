@@ -53,18 +53,22 @@ def test_data_conversion_retains_distractors_and_replays_exact_splits(dataset, t
     write_json(train, records(dataset, "train"))
     write_json(dev, records(dataset, "test"))
     first = tmp_path / "first"
-    manifest = prepare_data(dataset, train, dev, first, train_size=0, test_size=0)
-    docs = load_corpus(first / "raw/dataset_corpus.json")
-    assert len(docs) == 3
-    assert sum(d.title == "Distractor" for d in docs) == 2
-    qa = read_json(first / "raw/train.json")[0]
+    manifest = prepare_data(
+        dataset, train, dev, first, train_size=0, test_size=0, num_train_graphs=1
+    )
+    docs = load_corpus(first / "train_0/raw/dataset_corpus.json")
+    evaluation = load_corpus(first / "eval/raw/dataset_corpus.json")
+    assert len(docs) == len(evaluation) == 2
+    assert next(d.text for d in docs if d.title == "Distractor") == "train context."
+    assert next(d.text for d in evaluation if d.title == "Distractor") == "test context."
+    qa = read_json(first / "train_0/raw/train.json")[0]
     assert len(qa["supporting_facts"]) == 1
     assert next(d.title for d in docs if d.id == qa["supporting_facts"][0]) == "Ada"
     second = tmp_path / "second"
     replay = prepare_data(dataset, train, dev, second, seed=999, split_file=first / "split.json")
     assert replay["train_ids"] == manifest["train_ids"]
     assert replay["corpus_sha256"] == manifest["corpus_sha256"]
-    assert read_json(second / "raw/train.json") == [qa]
+    assert read_json(second / "train_0/raw/train.json") == [qa]
     if dataset == "musique":
         assert qa["answer_aliases"] == ["River Ford"]
     changed = records(dataset, "test")
@@ -99,11 +103,14 @@ def test_fixed_corpus_is_preserved_and_split_cannot_be_overwritten(tmp_path):
         ],
     )
     out = tmp_path / "out"
-    prepare_data("hotpotqa", train, dev, out, 0, 0, corpus_file=corpus)
-    assert read_json(out / "raw/dataset_corpus.json") == read_json(corpus)
-    assert read_json(out / "raw/train.json")[0]["supporting_facts"] == ["ada"]
+    prepare_data("hotpotqa", train, dev, out, 0, 0, corpus_file=corpus, num_train_graphs=1)
+    assert read_json(out / "train_0/raw/dataset_corpus.json") == read_json(corpus)[:2]
+    assert read_json(out / "eval/raw/dataset_corpus.json") == read_json(corpus)[:2]
+    assert read_json(out / "train_0/raw/train.json")[0]["supporting_facts"] == ["ada"]
     with pytest.raises(ValueError, match="different split"):
-        prepare_data("hotpotqa", train, dev, out, 0, 0, seed=13, corpus_file=corpus)
+        prepare_data(
+            "hotpotqa", train, dev, out, 0, 0, seed=13, corpus_file=corpus, num_train_graphs=1
+        )
 
 
 def test_dataset_zip_extracts_only_expected_files(tmp_path):
@@ -132,6 +139,57 @@ def test_twowiki_entity_aliases_and_demonyms_are_available_to_evaluation(tmp_pat
     aliases = tmp_path / "id_aliases.json"
     aliases.write_text('{"Q_id":"Q123","aliases":["River Ford"],"demonyms":["Riverfordian"]}\n')
     out = tmp_path / "out"
-    manifest = prepare_data("2wikimultihopqa", train, dev, out, 0, 0, alias_file=aliases)
-    assert read_json(out / "raw/train.json")[0]["answer_aliases"] == ["River Ford", "Riverfordian"]
+    manifest = prepare_data(
+        "2wikimultihopqa", train, dev, out, 0, 0, alias_file=aliases, num_train_graphs=1
+    )
+    assert read_json(out / "train_0/raw/train.json")[0]["answer_aliases"] == [
+        "River Ford",
+        "Riverfordian",
+    ]
     assert "aliases" in manifest["source_sha256"]
+
+
+@pytest.mark.parametrize("dataset", ["hotpotqa", "2wikimultihopqa", "musique"])
+def test_four_training_corpora_are_separate_from_evaluation(dataset, tmp_path):
+    train = [row for i in range(8) for row in records(dataset, f"train-{i}")]
+    test = [row for i in range(2) for row in records(dataset, f"evaluation-{i}")]
+    train_file, test_file = tmp_path / "train.json", tmp_path / "dev.json"
+    write_json(train_file, train)
+    write_json(test_file, test)
+    output = tmp_path / "prepared"
+    split = prepare_data(dataset, train_file, test_file, output, train_size=0, test_size=0)
+    assert len(split["train_groups"]) == 4
+    assigned = [key for ids in split["train_groups"].values() for key in ids]
+    assert len(assigned) == len(set(assigned)) == 8
+    assert set(assigned) == set(split["train_ids"])
+    assert not set(assigned).intersection(split["test_ids"])
+    for name, ids in split["train_groups"].items():
+        rows = read_json(output / name / "raw/train.json")
+        assert len(rows) == len(ids) == 2
+        assert [row["id"] for row in rows] == ids
+        corpus = read_json(output / name / "raw/dataset_corpus.json")
+        assert len(corpus) == 3
+        assert all("evaluation-" not in doc["text"] for doc in corpus)
+    corpus = read_json(output / "eval/raw/dataset_corpus.json")
+    assert len(corpus) == 3
+    assert all("train-" not in doc["text"] for doc in corpus)
+    replay = prepare_data(
+        dataset,
+        train_file,
+        test_file,
+        tmp_path / "replay",
+        seed=999,
+        split_file=output / "split.json",
+    )
+    assert replay == split
+    corrupted = copy.deepcopy(split)
+    corrupted["train_groups"]["train_0"][0] = split["test_ids"][0]
+    write_json(tmp_path / "invalid.json", corrupted)
+    with pytest.raises(ValueError, match="partition"):
+        prepare_data(
+            dataset,
+            train_file,
+            test_file,
+            tmp_path / "invalid",
+            split_file=tmp_path / "invalid.json",
+        )

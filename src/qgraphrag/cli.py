@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 from pathlib import Path
 
@@ -183,6 +184,37 @@ def _predict(config, graph, args):
         print(json.dumps(metrics, ensure_ascii=False))
 
 
+def _graph_config(config, name=None):
+    result = copy.deepcopy(config)
+    if config["datasets"]["root"] is None:
+        return result
+    name = name or config["datasets"]["eval_name"]
+    raw = Path(config["datasets"]["root"]) / name / "raw"
+    result["paths"].update(
+        corpus=str(raw / "dataset_corpus.json"),
+        index=str(Path(config["paths"]["index"]) / name),
+        train=str(raw / "train.json") if name in config["datasets"]["train_names"] else None,
+        valid=None,
+    )
+    return result
+
+
+def _training_configs(config):
+    if config["datasets"]["root"] is None:
+        return {"graph": _graph_config(config)}
+    names = config["datasets"]["train_names"]
+    if not names:
+        raise ValueError("Training requires datasets.train_names")
+    return {name: _graph_config(config, name) for name in names}
+
+
+def _index_configs(config):
+    if config["datasets"]["root"] is None:
+        return {"graph": _graph_config(config)}
+    names = config["datasets"]["train_names"] + [config["datasets"]["eval_name"]]
+    return {name: _graph_config(config, name) for name in names}
+
+
 def main(argv=None):
     args = _parser().parse_args(argv)
     config = load_config(args.config, args.set)
@@ -194,18 +226,65 @@ def main(argv=None):
     if args.command == "build-index":
         from .construction import build_index
 
-        graph = build_index(config, _backend(config))
-        print(
-            json.dumps(
-                {
-                    "documents": len(graph.documents),
-                    "entities": len(graph.entities),
-                    "edges": len(graph.edges),
-                    "fingerprint": graph.fingerprint,
-                }
+        backend = _backend(config)
+        for name, settings in _index_configs(config).items():
+            graph = build_index(settings, backend)
+            print(
+                json.dumps(
+                    {
+                        "graph": name,
+                        "documents": len(graph.documents),
+                        "entities": len(graph.entities),
+                        "edges": len(graph.edges),
+                        "fingerprint": graph.fingerprint,
+                    }
+                )
             )
-        )
         return
+    if args.command == "prepare":
+        encoder = _encoder(config)
+        for name, settings in _index_configs(config).items():
+            graph = GraphIndex.load(settings["paths"]["index"])
+            tensors = _graph_tensors(settings, graph, encoder)
+            print(
+                json.dumps(
+                    {
+                        "graph": name,
+                        "nodes": tensors.num_nodes,
+                        "edges": tensors.num_edges,
+                        "direct_relations": tensors.num_direct_relations,
+                    }
+                )
+            )
+        return
+    if args.command in ("pretrain", "finetune"):
+        from .linking import EntityLinker
+        from .training import finetune, prepare_queries, pretrain
+
+        encoder = _encoder(config)
+        backend = _backend(config) if args.command == "finetune" else None
+        graphs, training, validation = {}, {}, {}
+        for name, settings in _training_configs(config).items():
+            graph = GraphIndex.load(settings["paths"]["index"])
+            graphs[name] = _graph_tensors(settings, graph, encoder)
+            if args.command == "finetune":
+                linker = EntityLinker(graph, encoder, backend, config["retrieval"]["linking_top_k"])
+                cache = Path(settings["paths"]["index"]) / "cache"
+                training[name] = prepare_queries(
+                    settings["paths"]["train"], graph, encoder, linker, cache
+                )
+                if settings["paths"]["valid"]:
+                    validation[name] = prepare_queries(
+                        settings["paths"]["valid"], graph, encoder, linker, cache
+                    )
+                del linker
+            del graph
+        if args.command == "pretrain":
+            pretrain(config, graphs, resume=args.resume)
+        else:
+            finetune(config, graphs, training, validation or None, args.pretrained, args.resume)
+        return
+    config = _graph_config(config)
     graph = GraphIndex.load(config["paths"]["index"])
     if args.command == "inspect-index":
         print(
@@ -220,43 +299,6 @@ def main(argv=None):
                 indent=2,
             )
         )
-    elif args.command == "prepare":
-        tensors = _graph_tensors(config, graph, _encoder(config))
-        print(
-            json.dumps(
-                {
-                    "nodes": tensors.num_nodes,
-                    "edges": tensors.num_edges,
-                    "direct_relations": tensors.num_direct_relations,
-                }
-            )
-        )
-    elif args.command == "pretrain":
-        from .training import pretrain
-
-        tensors = _graph_tensors(config, graph, _encoder(config))
-        pretrain(config, tensors, resume=args.resume)
-    elif args.command == "finetune":
-        from .linking import EntityLinker
-        from .training import finetune, prepare_queries
-
-        encoder = _encoder(config)
-        linker = EntityLinker(
-            graph, encoder, _backend(config), config["retrieval"]["linking_top_k"]
-        )
-        cache_dir = Path(config["paths"]["index"]) / "cache"
-        train_data = prepare_queries(config["paths"]["train"], graph, encoder, linker, cache_dir)
-        valid_data = (
-            prepare_queries(config["paths"]["valid"], graph, encoder, linker, cache_dir)
-            if config["paths"]["valid"]
-            else None
-        )
-        if valid_data:
-            train_ids = {r["id"] for r in train_data["samples"]}
-            if train_ids & {r["id"] for r in valid_data["samples"]}:
-                raise ValueError("Training and validation query IDs overlap")
-        tensors = _graph_tensors(config, graph, encoder)
-        finetune(config, tensors, train_data, valid_data, args.pretrained, args.resume)
     elif args.command == "cache-gates":
         from .checkpoints import load_checkpoint
 

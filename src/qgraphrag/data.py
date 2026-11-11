@@ -1,10 +1,11 @@
-"""Download public benchmarks and build a shared document corpus with reproducible splits."""
+"""Prepare graph-specific training corpora and a separate evaluation corpus."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import random
+import re
 import shutil
 import urllib.error
 import urllib.request
@@ -207,30 +208,78 @@ def load_answer_aliases(path):
     return aliases
 
 
+def _convert_graph(rows, dataset, external_documents, answer_aliases):
+    by_content = {(d.title, d.text): d for d in external_documents or []}
+    by_title = {}
+    for document in external_documents or []:
+        by_title.setdefault(document.title, []).append(document)
+    documents, queries = {}, []
+    for row in rows:
+        entries, support = _context(row, dataset)
+        context_ids = {}
+        for key, title, text in entries:
+            if external_documents is None:
+                document = Document(fingerprint([title, text])[:24], title, text)
+            else:
+                document = by_content.get((title, text))
+                if document is None:
+                    options = by_title.get(title, [])
+                    if len(options) != 1:
+                        raise ValueError(
+                            f"Context document missing/ambiguous in supplied corpus: {title}"
+                        )
+                    document = options[0]
+            documents[document.id] = document
+            context_ids[key] = document.id
+        answer = row.get("answer")
+        if not isinstance(answer, (str, int, float)):
+            raise ValueError(f"Missing reference answer: {question_id(row)}")
+        aliases = row.get("answer_aliases", [])
+        if not isinstance(aliases, list) or any(not isinstance(a, str) for a in aliases):
+            raise ValueError("answer_aliases must be a string list")
+        aliases = sorted(set(aliases + answer_aliases.get(row.get("answer_id"), [])))
+        queries.append(
+            {
+                "id": question_id(row),
+                "question": nonempty(row.get("question"), "question"),
+                "answer": str(answer),
+                "answer_aliases": aliases,
+                "supporting_facts": list(dict.fromkeys(context_ids[key] for key in support)),
+            }
+        )
+    corpus = [asdict(documents[key]) for key in sorted(documents)]
+    return corpus, queries
+
+
 def prepare_data(
     dataset,
     train_file,
     dev_file,
     output,
-    train_size=2000,
+    train_size=4000,
     test_size=1000,
     seed=1024,
     split_file=None,
     corpus_file=None,
     alias_file=None,
+    num_train_graphs=4,
 ):
     if dataset not in DATASETS:
         raise ValueError(f"Unknown dataset: {dataset}")
     answer_aliases = load_answer_aliases(alias_file)
     specification = read_json(split_file) if split_file else None
-    if specification and specification.get("dataset", dataset) != dataset:
-        raise ValueError("Split manifest dataset mismatch")
+    if specification:
+        if specification.get("schema_version") != 2:
+            raise ValueError("Unsupported split manifest; prepare graph-specific corpora again")
+        if specification.get("dataset") != dataset:
+            raise ValueError("Split manifest dataset mismatch")
+        seed = specification["seed"]
     source_hashes = {"train": file_sha256(train_file), "dev": file_sha256(dev_file)}
     if corpus_file:
         source_hashes["corpus"] = file_sha256(corpus_file)
     if alias_file:
         source_hashes["aliases"] = file_sha256(alias_file)
-    if specification and specification.get("source_sha256", source_hashes) != source_hashes:
+    if specification and specification.get("source_sha256") != source_hashes:
         raise ValueError("Source files differ from the split manifest")
     train = select_records(
         read_records(train_file),
@@ -244,77 +293,64 @@ def prepare_data(
         seed + 1,
         specification["test_ids"] if specification else None,
     )
-    if {question_id(row) for row in train} & {question_id(row) for row in test}:
+    train_ids, test_ids = [question_id(row) for row in train], [question_id(row) for row in test]
+    if set(train_ids) & set(test_ids):
         raise ValueError("Training and evaluation question IDs overlap")
-    documents = load_corpus(corpus_file) if corpus_file else []
-    by_content = {(d.title, d.text): d.id for d in documents}
-    by_title = {}
-    for doc in documents:
-        by_title.setdefault(doc.title, []).append(doc.id)
-    converted = []
-    for rows in (train, test):
-        result = []
-        for row in rows:
-            entries, support = _context(row, dataset)
-            context_ids = {}
-            for key, title, text in entries:
-                identity = (title, text)
-                doc_id = by_content.get(identity)
-                if doc_id is None and corpus_file:
-                    options = by_title.get(title, [])
-                    if len(options) != 1:
-                        raise ValueError(
-                            f"Context document missing/ambiguous in supplied corpus: {title}"
-                        )
-                    doc_id = options[0]
-                if doc_id is None:
-                    doc_id = fingerprint([title, text])[:24]
-                    documents.append(Document(doc_id, title, text))
-                    by_content[identity] = doc_id
-                context_ids[key] = doc_id
-            answer = row.get("answer")
-            if not isinstance(answer, (str, int, float)):
-                raise ValueError(f"Missing reference answer: {question_id(row)}")
-            aliases = row.get("answer_aliases", [])
-            if not isinstance(aliases, list) or any(not isinstance(a, str) for a in aliases):
-                raise ValueError("answer_aliases must be a string list")
-            aliases = sorted(set(aliases + answer_aliases.get(row.get("answer_id"), [])))
-            result.append(
-                {
-                    "id": question_id(row),
-                    "question": nonempty(row.get("question"), "question"),
-                    "answer": str(answer),
-                    "answer_aliases": aliases,
-                    "supporting_facts": list(dict.fromkeys(context_ids[key] for key in support)),
-                }
+    if specification:
+        groups = specification.get("train_groups")
+        if not isinstance(groups, dict) or not groups:
+            raise ValueError("Missing training groups in split manifest")
+    else:
+        if type(num_train_graphs) is not int or not 1 <= num_train_graphs <= len(train):
+            raise ValueError(
+                "num_train_graphs must be between 1 and the number of training questions"
             )
-        converted.append(result)
-    documents.sort(key=lambda doc: doc.id)
-    corpus = [asdict(doc) for doc in documents]
+        groups = {
+            f"train_{i}": train_ids[
+                i * len(train) // num_train_graphs : (i + 1) * len(train) // num_train_graphs
+            ]
+            for i in range(num_train_graphs)
+        }
+    assigned = []
+    for name, ids in groups.items():
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) or name == "eval":
+            raise ValueError("Invalid training graph name in split manifest")
+        if not isinstance(ids, list) or not ids or any(not isinstance(key, str) for key in ids):
+            raise ValueError("Each training graph requires question IDs")
+        assigned.extend(ids)
+    if len(set(assigned)) != len(assigned) or set(assigned) != set(train_ids):
+        raise ValueError("Training groups must partition the selected training questions")
+    external_documents = load_corpus(corpus_file) if corpus_file else None
+    by_id = {question_id(row): row for row in train}
+    prepared = {
+        name: _convert_graph(
+            [by_id[key] for key in ids], dataset, external_documents, answer_aliases
+        )
+        for name, ids in groups.items()
+    }
+    prepared["eval"] = _convert_graph(test, dataset, external_documents, answer_aliases)
     manifest = {
+        "schema_version": 2,
         "dataset": dataset,
         "seed": seed,
-        "train_ids": [question_id(row) for row in train],
-        "test_ids": [question_id(row) for row in test],
+        "train_ids": train_ids,
+        "test_ids": test_ids,
+        "train_groups": groups,
         "source_sha256": source_hashes,
-        "corpus_mode": "provided" if corpus_file else "all_selected_contexts",
-        "corpus_sha256": fingerprint(corpus),
-        "documents": len(documents),
+        "corpus_mode": "provided_contexts" if corpus_file else "selected_contexts",
+        "corpus_sha256": {name: fingerprint(corpus) for name, (corpus, _) in prepared.items()},
+        "documents": {name: len(corpus) for name, (corpus, _) in prepared.items()},
     }
-    if (
-        specification
-        and specification.get("corpus_sha256", manifest["corpus_sha256"])
-        != manifest["corpus_sha256"]
-    ):
-        raise ValueError("Prepared corpus differs from the split manifest")
+    if specification and specification != manifest:
+        raise ValueError("Prepared graph corpora differ from the split manifest")
     destination = Path(output)
-    raw = destination / "raw"
     existing = destination / "split.json"
     if existing.exists() and read_json(existing) != manifest:
         raise ValueError("Output already contains a different split; choose a new output directory")
-    write_json(raw / "dataset_corpus.json", corpus)
-    write_json(raw / "train.json", converted[0])
-    write_json(raw / "test.json", converted[1])
+    for name, (corpus, queries) in prepared.items():
+        raw = destination / name / "raw"
+        write_json(raw / "dataset_corpus.json", corpus)
+        write_json(raw / ("test.json" if name == "eval" else "train.json"), queries)
     write_json(existing, manifest)
     return manifest
 
@@ -331,16 +367,17 @@ def main(argv=None):
     )
     parser.add_argument("--dev-file")
     parser.add_argument(
-        "--train-size", type=int, default=2000, help="0 selects the entire training split"
+        "--train-size", type=int, default=4000, help="0 selects the entire training split"
     )
     parser.add_argument(
         "--test-size", type=int, default=1000, help="0 selects the entire development split"
     )
+    parser.add_argument("--num-train-graphs", type=int, default=4)
     parser.add_argument("--seed", type=int, default=1024)
     parser.add_argument("--split-file", help="Existing split.json with exact train_ids/test_ids")
     parser.add_argument("--answer-aliases", help="Official 2Wiki id_aliases.json file")
     parser.add_argument(
-        "--corpus", help="Use an existing shared corpus instead of collecting contexts"
+        "--corpus", help="Resolve each graph's candidate passages against an existing corpus"
     )
     args = parser.parse_args(argv)
     if args.download:
@@ -366,12 +403,14 @@ def main(argv=None):
         args.split_file,
         args.corpus,
         alias_file,
+        args.num_train_graphs,
     )
     print(
         json.dumps(
             {
                 "train": len(manifest["train_ids"]),
                 "test": len(manifest["test_ids"]),
+                "train_graphs": len(manifest["train_groups"]),
                 "documents": manifest["documents"],
                 "split": str(Path(args.output) / "split.json"),
             }

@@ -152,96 +152,178 @@ def _log(directory, row):
         stream.write(json.dumps(row) + "\n")
 
 
+def _graphs(graph):
+    items = graph if isinstance(graph, dict) else {"graph": graph}
+    if not items:
+        raise ValueError("Training requires at least one graph")
+    graphs = {name: items[name].to("cpu") for name in sorted(items)}
+    first = next(iter(graphs.values()))
+    for value in graphs.values():
+        value.validate()
+        if not value.num_edges or not value.num_nodes:
+            raise ValueError("Cannot train on an empty graph")
+        if value.encoder_signature != first.encoder_signature:
+            raise ValueError("Training graphs use different text encoders")
+        if value.relation_embeddings.shape[1] != first.relation_embeddings.shape[1]:
+            raise ValueError("Training graph embedding dimensions differ")
+    return graphs
+
+
+def _query_sets(data, graphs, *, validation=False):
+    if data is None:
+        return None
+    if "samples" in data and "question_embeddings" in data:
+        if len(graphs) != 1:
+            raise ValueError("Provide graph-specific query sets for multi-graph training")
+        data = {next(iter(graphs)): data}
+    if not isinstance(data, dict) or not data:
+        raise ValueError("Missing query sets")
+    if not set(data) <= set(graphs) or (not validation and set(data) != set(graphs)):
+        raise ValueError("Query sets do not match the training graphs")
+    seen = set()
+    for name, records in data.items():
+        if not records["samples"]:
+            raise ValueError(f"Empty query set: {name}")
+        ids = [row["id"] for row in records["samples"]]
+        if len(set(ids)) != len(ids) or seen.intersection(ids):
+            raise ValueError("Training graphs contain duplicate query IDs")
+        seen.update(ids)
+    return {name: data[name] for name in graphs if name in data}
+
+
+def _fingerprints(graphs, data=None):
+    result = {
+        "graph_fingerprints": {name: graph.graph_fingerprint for name, graph in graphs.items()}
+    }
+    if data is not None:
+        result["training_fingerprints"] = {name: rows["fingerprint"] for name, rows in data.items()}
+    return result
+
+
+def _check_resume(metadata, graphs, stage, data=None):
+    if metadata["stage"] != stage:
+        raise ValueError("Checkpoint training stage mismatch")
+    expected = _fingerprints(graphs, data)
+    for key, values in expected.items():
+        saved = metadata.get(key)
+        if saved is None and len(graphs) == 1:
+            legacy_key = (
+                "graph_fingerprint" if key == "graph_fingerprints" else "training_fingerprint"
+            )
+            saved = {next(iter(graphs)): metadata.get(legacy_key)}
+        if saved != values:
+            raise ValueError("Resume graph/training data mismatch")
+    _check_encoder(metadata, next(iter(graphs.values())))
+
+
+def _batch_plan(sizes, batch_size, limit, generator):
+    counts = {name: math.ceil(size / batch_size) for name, size in sizes.items()}
+    total = sum(counts.values())
+    selected = None
+    if limit is not None and limit < total:
+        selected = set(torch.randperm(total, generator=generator)[:limit].tolist())
+    plan, offset = {}, 0
+    for name, count in counts.items():
+        plan[name] = (
+            range(count)
+            if selected is None
+            else [i for i in range(count) if offset + i in selected]
+        )
+        offset += count
+    names = list(sizes)
+    order = [names[i] for i in torch.randperm(len(names), generator=generator).tolist()]
+    return order, plan
+
+
 def pretrain(config, graph, resume=None):
     seed_everything(config["seed"])
+    graphs = _graphs(graph)
+    first = next(iter(graphs.values()))
     settings = config["pretrain"]
     directory = Path(config["paths"]["output"])
     directory.mkdir(parents=True, exist_ok=True)
     metadata = None
     if resume:
         model, metadata = load_checkpoint(resume, config["device"])
-        _check_encoder(metadata, graph)
-        if (
-            metadata["stage"] != "pretrain"
-            or metadata["graph_fingerprint"] != graph.graph_fingerprint
-        ):
-            raise ValueError("Resume requires a pretraining checkpoint of the same graph")
+        _check_resume(metadata, graphs, "pretrain")
     else:
-        model = QualityGNNRetriever(config["model"], graph.relation_embeddings.shape[1]).to(
+        model = QualityGNNRetriever(config["model"], first.relation_embeddings.shape[1]).to(
             config["device"]
         )
     _save_run_config(directory, config, model)
     optimizer = _optimizer(model, settings)
-    start_epoch = 0
     if metadata:
         optimizer.load_state_dict(metadata["optimizer"])
-        start_epoch = metadata["epoch"]
-    sampler = StrictNegativeSampler(graph)
-    cpu_edges, cpu_types = graph.edge_index.cpu(), graph.edge_type.cpu()
-    graph = graph.to(config["device"])
+    start_epoch = metadata["epoch"] if metadata else 0
     best_loss = metadata.get("best_loss", math.inf) if metadata else math.inf
+    samplers = {name: StrictNegativeSampler(value) for name, value in graphs.items()}
+    sizes = {name: value.edge_type.numel() for name, value in graphs.items()}
     for epoch in range(start_epoch, settings["epochs"]):
         model.train()
         generator = torch.Generator().manual_seed(config["seed"] + epoch)
-        order = torch.randperm(cpu_types.numel(), generator=generator)
-        if settings["steps_per_epoch"]:
-            order = order[: settings["steps_per_epoch"] * settings["batch_size"]]
-        losses = []
-        for left in tqdm(
-            range(0, len(order), settings["batch_size"]), desc=f"KG epoch {epoch + 1}"
-        ):
-            ids = order[left : left + settings["batch_size"]]
-            source, positive = cpu_edges[:, ids]
-            relation = cpu_types[ids]
-            negatives = torch.stack(
-                [
-                    sampler.sample(h, r, settings["num_negative"], generator)
-                    for h, r in zip(source.tolist(), relation.tolist())
-                ]
-            )
-            candidates = torch.cat((positive.unsqueeze(1), negatives), dim=1).to(config["device"])
-            blocked = graph.edge_to_final[ids.to(config["device"])].unique()
-            optimizer.zero_grad(set_to_none=True)
-            logits = model.completion(
-                graph,
-                source.to(config["device"]),
-                relation.to(config["device"]),
-                candidates,
-                blocked,
-            )
-            loss = completion_loss(logits, settings["adversarial_temperature"])
-            if not torch.isfinite(loss):
-                raise FloatingPointError("Nonfinite completion loss")
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(), settings["max_grad_norm"], error_if_nonfinite=True
-            )
-            optimizer.step()
-            losses.append((float(loss.detach()), len(ids)))
-        mean_loss = sum(x * n for x, n in losses) / sum(n for _, n in losses)
+        names, plan = _batch_plan(
+            sizes, settings["batch_size"], settings["steps_per_epoch"], generator
+        )
+        losses, examples = [], {name: 0 for name in graphs}
+        for name in names:
+            if not len(plan[name]):
+                continue
+            cpu_graph = graphs[name]
+            active = cpu_graph.to(config["device"])
+            order = torch.randperm(sizes[name], generator=generator)
+            for batch_index in tqdm(plan[name], desc=f"KG epoch {epoch + 1}: {name}"):
+                left = batch_index * settings["batch_size"]
+                ids = order[left : left + settings["batch_size"]]
+                source, positive = cpu_graph.edge_index[:, ids]
+                relation = cpu_graph.edge_type[ids]
+                negatives = torch.stack(
+                    [
+                        samplers[name].sample(h, r, settings["num_negative"], generator)
+                        for h, r in zip(source.tolist(), relation.tolist())
+                    ]
+                )
+                candidates = torch.cat((positive.unsqueeze(1), negatives), dim=1).to(
+                    config["device"]
+                )
+                blocked = cpu_graph.edge_to_final[ids].unique().to(config["device"])
+                optimizer.zero_grad(set_to_none=True)
+                logits = model.completion(
+                    active,
+                    source.to(config["device"]),
+                    relation.to(config["device"]),
+                    candidates,
+                    blocked,
+                )
+                loss = completion_loss(logits, settings["adversarial_temperature"])
+                if not torch.isfinite(loss):
+                    raise FloatingPointError("Nonfinite completion loss")
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), settings["max_grad_norm"], error_if_nonfinite=True
+                )
+                optimizer.step()
+                losses.append((float(loss.detach()), len(ids)))
+                examples[name] += len(ids)
+            del active
+        mean_loss = sum(value * count for value, count in losses) / sum(
+            count for _, count in losses
+        )
         improved = mean_loss < best_loss
         best_loss = min(best_loss, mean_loss)
         extra = {
             "optimizer": optimizer.state_dict(),
             "epoch": epoch + 1,
             "best_loss": best_loss,
-            "quality_feature_version": graph.quality_feature_version,
+            "quality_feature_version": first.quality_feature_version,
+            **_fingerprints(graphs),
         }
-        save_checkpoint(
-            directory / "last.pt",
-            model,
-            graph.encoder_signature,
-            "pretrain",
-            graph.graph_fingerprint,
-            **extra,
-        )
-        if improved:
+        for filename in ["last.pt", "best.pt"] if improved else ["last.pt"]:
             save_checkpoint(
-                directory / "best.pt",
+                directory / filename,
                 model,
-                graph.encoder_signature,
+                first.encoder_signature,
                 "pretrain",
-                graph.graph_fingerprint,
+                first.graph_fingerprint if len(graphs) == 1 else None,
                 **extra,
             )
         _log(
@@ -252,6 +334,7 @@ def pretrain(config, graph, resume=None):
                 "loss": mean_loss,
                 "quality_enabled": False,
                 "steps": len(losses),
+                "examples_by_graph": examples,
             },
         )
     return model
@@ -275,22 +358,25 @@ def finetune(config, graph, train_data, valid_data, pretrained=None, resume=None
             "Fine-tuning requires --pretrained or --resume; stage-one training cannot be skipped"
         )
     seed_everything(config["seed"])
+    graphs = _graphs(graph)
+    first = next(iter(graphs.values()))
+    training = _query_sets(train_data, graphs)
+    validation = _query_sets(valid_data, graphs, validation=True)
+    if validation:
+        train_ids = {row["id"] for data in training.values() for row in data["samples"]}
+        valid_ids = {row["id"] for data in validation.values() for row in data["samples"]}
+        if train_ids & valid_ids:
+            raise ValueError("Training and validation query IDs overlap")
     settings = config["finetune"]
     directory = Path(config["paths"]["output"])
     directory.mkdir(parents=True, exist_ok=True)
     metadata = None
     if resume:
         model, metadata = load_checkpoint(resume, config["device"])
-        _check_encoder(metadata, graph)
-        if (
-            metadata["stage"] != "finetune"
-            or metadata["graph_fingerprint"] != graph.graph_fingerprint
-            or metadata.get("training_fingerprint") != train_data["fingerprint"]
-        ):
-            raise ValueError("Fine-tuning resume graph/training data/stage mismatch")
+        _check_resume(metadata, graphs, "finetune", training)
     else:
         previous, prior = load_checkpoint(pretrained, for_initialization=True)
-        _check_encoder(prior, graph)
+        _check_encoder(prior, first)
         model = QualityGNNRetriever(previous.model_config, previous.embedding_dim)
         initialize_from_pretrain(model, pretrained)
         model = model.to(config["device"])
@@ -300,39 +386,58 @@ def finetune(config, graph, train_data, valid_data, pretrained=None, resume=None
         optimizer.load_state_dict(metadata["optimizer"])
     start_epoch = metadata["epoch"] if metadata else 0
     best_loss = metadata.get("best_loss", math.inf) if metadata else math.inf
-    graph = graph.to(config["device"])
-    quality_gradient_seen = False
+    quality_gradient_seen = metadata.get("quality_gradient_seen", False) if metadata else False
+    sizes = {name: len(data["samples"]) for name, data in training.items()}
     for epoch in range(start_epoch, settings["epochs"]):
         model.train()
         generator = torch.Generator().manual_seed(config["seed"] + epoch)
-        order = torch.randperm(len(train_data["samples"]), generator=generator).tolist()
-        if settings["steps_per_epoch"]:
-            order = order[: settings["steps_per_epoch"] * settings["batch_size"]]
-        losses = []
-        for left in tqdm(
-            range(0, len(order), settings["batch_size"]), desc=f"QA epoch {epoch + 1}"
-        ):
-            indices = order[left : left + settings["batch_size"]]
-            questions, seeds, labels = query_batch(
-                train_data, indices, graph.num_nodes, config["device"]
+        names, plan = _batch_plan(
+            sizes, settings["batch_size"], settings["steps_per_epoch"], generator
+        )
+        losses, examples = [], {name: 0 for name in graphs}
+        for name in names:
+            if not len(plan[name]):
+                continue
+            active = graphs[name].to(config["device"])
+            order = torch.randperm(sizes[name], generator=generator).tolist()
+            for batch_index in tqdm(plan[name], desc=f"QA epoch {epoch + 1}: {name}"):
+                left = batch_index * settings["batch_size"]
+                indices = order[left : left + settings["batch_size"]]
+                questions, seeds, labels = query_batch(
+                    training[name], indices, active.num_nodes, config["device"]
+                )
+                optimizer.zero_grad(set_to_none=True)
+                logits = model(active, questions, seeds).logits
+                loss = retrieval_loss(logits, labels, settings)
+                if not torch.isfinite(loss):
+                    raise FloatingPointError("Nonfinite retrieval loss")
+                loss.backward()
+                quality_gradient_seen |= any(
+                    p.grad is not None and bool(p.grad.abs().sum() > 0)
+                    for p in model.quality_encoder.parameters()
+                )
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), settings["max_grad_norm"], error_if_nonfinite=True
+                )
+                optimizer.step()
+                losses.append((float(loss.detach()), len(indices)))
+                examples[name] += len(indices)
+            del active
+        train_loss = sum(value * count for value, count in losses) / sum(
+            count for _, count in losses
+        )
+        score = train_loss
+        if validation:
+            values = []
+            for name, data in validation.items():
+                active = graphs[name].to(config["device"])
+                values.append(
+                    (validation_loss(model, active, data, settings), len(data["samples"]))
+                )
+                del active
+            score = sum(value * count for value, count in values) / sum(
+                count for _, count in values
             )
-            optimizer.zero_grad(set_to_none=True)
-            logits = model(graph, questions, seeds).logits
-            loss = retrieval_loss(logits, labels, settings)
-            if not torch.isfinite(loss):
-                raise FloatingPointError("Nonfinite retrieval loss")
-            loss.backward()
-            quality_gradient_seen |= any(
-                p.grad is not None and bool(p.grad.abs().sum() > 0)
-                for p in model.quality_encoder.parameters()
-            )
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(), settings["max_grad_norm"], error_if_nonfinite=True
-            )
-            optimizer.step()
-            losses.append((float(loss.detach()), len(indices)))
-        train_loss = sum(x * n for x, n in losses) / sum(n for _, n in losses)
-        score = validation_loss(model, graph, valid_data, settings) if valid_data else train_loss
         improved = score < best_loss
         best_loss = min(score, best_loss)
         if not quality_gradient_seen:
@@ -343,26 +448,21 @@ def finetune(config, graph, train_data, valid_data, pretrained=None, resume=None
             "optimizer": optimizer.state_dict(),
             "epoch": epoch + 1,
             "best_loss": best_loss,
-            "training_fingerprint": train_data["fingerprint"],
-            "selection_metric": "validation_loss" if valid_data else "training_loss",
+            "training_fingerprint": next(iter(training.values()))["fingerprint"]
+            if len(graphs) == 1
+            else None,
+            "selection_metric": "validation_loss" if validation else "training_loss",
             "quality_gradient_seen": quality_gradient_seen,
-            "quality_feature_version": graph.quality_feature_version,
+            "quality_feature_version": first.quality_feature_version,
+            **_fingerprints(graphs, training),
         }
-        save_checkpoint(
-            directory / "last.pt",
-            model,
-            graph.encoder_signature,
-            "finetune",
-            graph.graph_fingerprint,
-            **extra,
-        )
-        if improved:
+        for filename in ["last.pt", "best.pt"] if improved else ["last.pt"]:
             save_checkpoint(
-                directory / "best.pt",
+                directory / filename,
                 model,
-                graph.encoder_signature,
+                first.encoder_signature,
                 "finetune",
-                graph.graph_fingerprint,
+                first.graph_fingerprint if len(graphs) == 1 else None,
                 **extra,
             )
         _log(
@@ -373,15 +473,15 @@ def finetune(config, graph, train_data, valid_data, pretrained=None, resume=None
                 "loss": train_loss,
                 "selection_loss": score,
                 "steps": len(losses),
+                "examples_by_graph": examples,
                 "quality_gradient_seen": quality_gradient_seen,
             },
         )
-    if start_epoch < settings["epochs"] and not quality_gradient_seen:
-        raise RuntimeError(
-            "No quality-encoder gradient observed; check query seeds/graph supervision"
-        )
     model.eval()
-    model.cache_gates(graph, directory / "last_gates.pt")
-    best_model, _ = load_checkpoint(directory / "best.pt", config["device"])
-    best_model.eval().cache_gates(graph, directory / "best_gates.pt")
+    if len(graphs) == 1:
+        active = first.to(config["device"])
+        model.cache_gates(active, directory / "last_gates.pt")
+        if (directory / "best.pt").exists():
+            best_model, _ = load_checkpoint(directory / "best.pt", config["device"])
+            best_model.eval().cache_gates(active, directory / "best_gates.pt")
     return model

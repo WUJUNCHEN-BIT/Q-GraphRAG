@@ -45,16 +45,19 @@ with --source-dir /path/to/files. The command also accepts --train-file and --de
 For 2Wiki, id_aliases.json is detected beside train.json, or can be supplied with
 --answer-aliases; its aliases and demonyms are retained for answer evaluation.
 
-Each output directory contains raw/dataset_corpus.json, raw/train.json, raw/test.json,
-and split.json. The preparation defaults select 2,000 training questions and 1,000
-questions from the official development split with seed 1024. Use --train-size and
---test-size to change these counts, or --split-file to supply exact question IDs.
-A count of zero selects the entire source split.
+Preparation selects 4,000 training questions and 1,000 evaluation questions from the
+official training and development splits, respectively, with seed 1024. Training questions
+are divided into four groups of 1,000. Each group has its own corpus under
+train_0/raw/ through train_3/raw/; evaluation has a separate corpus and test.json under
+eval/raw/. Corpora retain all candidate passages, including distractors. split.json records
+question IDs, graph assignments, and source/corpus hashes.
 
-The shared corpus contains all context paragraphs, including distractors, from the
-selected questions. To use a fixed external corpus instead, pass --corpus corpus.json.
-The split manifest records question IDs, source hashes, and the corpus hash. Raw data,
-model weights, and generated artifacts are excluded from the repository.
+Use --train-size, --test-size, and --num-train-graphs for other sizes, or --split-file to
+replay a saved split. A size of zero selects the entire source split. When changing the
+graph count, update datasets.train_names in the dataset configuration. Use a new output
+directory for a different split. --corpus can supply an external document collection from
+which each group's candidate passages are resolved.
+Raw data, model weights, and generated artifacts are excluded from the repository.
 
 Custom corpora use a JSON list of objects with id, title, and text. QA files use a JSON
 list with id, question, answer, and supporting_facts (a list of document IDs or
@@ -66,10 +69,12 @@ only the question and optional question-side mentions.
 ## Run
 
 The following commands use configs/hotpotqa.yaml. Replace the configuration path for
-2WikiMultihopQA or MuSiQue.
+2WikiMultihopQA or MuSiQue. The dataset configurations specify four training graphs
+and one evaluation graph. A single model and optimizer are shared across the training
+graphs; each batch uses one graph. Prediction uses only the evaluation graph.
 
 ~~~bash
-# Construct the graph, provenance index, and final-edge quality features.
+# Construct and encode the four training graphs and the evaluation graph.
 qgraphrag --config configs/hotpotqa.yaml build-index
 qgraphrag --config configs/hotpotqa.yaml prepare
 
@@ -78,16 +83,16 @@ qgraphrag --config configs/hotpotqa.yaml --set paths.output=outputs/hotpotqa/pre
 
 # Joint GNN and quality-encoder training with retrieval supervision.
 qgraphrag --config configs/hotpotqa.yaml --set paths.output=outputs/hotpotqa/finetune finetune \
-  --pretrained outputs/hotpotqa/pretrain/best.pt
+  --pretrained outputs/hotpotqa/pretrain/last.pt
 
 # Retrieval, sufficiency assessment, optional text supplementation, and QA.
 qgraphrag --config configs/hotpotqa.yaml --set paths.output=outputs/hotpotqa/predict predict \
-  --checkpoint outputs/hotpotqa/finetune/best.pt --queries data/hotpotqa/raw/test.json
+  --checkpoint outputs/hotpotqa/finetune/last.pt --queries data/hotpotqa/eval/raw/test.json
 ~~~
 
-For a single question, use ask --checkpoint /path/to/best.pt --question "Your question".
-Training supports --resume. predict resumes completed queries in the same output
-directory and writes final-document Recall@K, answer EM, and token F1 when labels are present.
+For a single question, use ask --checkpoint /path/to/last.pt --question "Your question".
+Training supports --resume with the same training graph collection. predict resumes
+completed queries in the same output directory and writes final-document Recall@K, answer EM, and token F1 when labels are present.
 
 A compatible GFM-RAG DistMult/sum export can initialize the backbone:
 
@@ -102,15 +107,20 @@ quality-aware inference requires a matching jointly fine-tuned checkpoint.
 
 ## Configuration
 
-configs/default.yaml contains the default settings; dataset configurations override paths.
+The defaults in config.py are also listed in configs/default.yaml; dataset configurations
+specify graph names and paths.
 All settings can be changed with --set section.key=value. Training writes the effective
 configuration alongside checkpoints. Defaults use Qwen3-14B-AWQ, all-mpnet-base-v2,
-and ms-marco-MiniLM-L-6-v2; the final evidence budget is five documents.
+and ms-marco-MiniLM-L6-v2; the final evidence budget is five documents.
 
 Text supplementation allows up to two rounds (retrieval.max_supplementation_rounds).
 Each round merges and deduplicates documents, then reassesses sufficiency. The loop stops
 when evidence is sufficient, the round limit is reached, or no new documents are added.
 The PCST subgraph stays fixed throughout refinement.
+
+For graph-builder comparisons, override llm.model and its endpoint only for build-index.
+Use a separate paths.index and paths.output for each builder, and repeat pretraining and
+fine-tuning. Keep the query-side and answering LLM settings unchanged.
 
 ## Tests
 

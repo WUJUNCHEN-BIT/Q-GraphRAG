@@ -1,6 +1,7 @@
+datasets:
+  root: data/2wikimultihopqa
+  train_names: [train_0, train_1, train_2, train_3]
+  eval_name: eval
 paths:
-  corpus: data/2wikimultihopqa/raw/dataset_corpus.json
-  train: data/2wikimultihopqa/raw/train.json
-  valid: null
-  index: artifacts/2wikimultihopqa/index
+  index: artifacts/2wikimultihopqa
   output: outputs/2wikimultihopqa/run

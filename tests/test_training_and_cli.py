@@ -172,3 +172,246 @@ def test_prediction_manifest_rejects_previous_pipeline_version(
             toy_graph,
             SimpleNamespace(queries=queries, checkpoint=checkpoint, limit=None),
         )
+
+
+@pytest.mark.parametrize("dataset", ["hotpotqa", "2wikimultihopqa", "musique"])
+def test_dataset_configuration_resolves_four_training_graphs_and_heldout_graph(dataset):
+    from pathlib import Path
+
+    from qgraphrag.cli import _graph_config, _index_configs, _training_configs
+    from qgraphrag.config import load_config
+
+    path = Path(__file__).resolve().parents[1] / "configs" / (dataset + ".yaml")
+    config = load_config(path)
+    assert config["pretrain"]["batch_size"] == config["finetune"]["batch_size"] == 4
+    assert config["retrieval"]["entity_top_k"] == 20 and config["pcst"]["top_m"] == 5
+    training = _training_configs(config)
+    assert list(training) == [f"train_{i}" for i in range(4)]
+    assert len(_index_configs(config)) == 5
+    evaluation = _graph_config(config)
+    assert Path(evaluation["paths"]["index"]).name == "eval"
+    assert evaluation["paths"]["train"] is None
+    for name, value in training.items():
+        assert Path(value["paths"]["index"]).name == name
+        assert Path(value["paths"]["train"]).parent.parent.name == name
+
+
+def _training_graphs(toy_graph, assessed_source):
+    import copy
+
+    from qgraphrag.construction import assess_edge
+
+    graphs = {"train_0": copy.deepcopy(toy_graph)}
+    for i in range(1, 4):
+        graph = copy.deepcopy(toy_graph)
+        graph.entities = sorted(graph.entities + [f"a extra node {j}" for j in range(i)])
+        edge = copy.deepcopy(graph.edges[0])
+        edge.id = "extra-edge"
+        edge.relation = f"associated via relation {i}"
+        edge.sources = [
+            assessed_source(
+                edge.sources[0],
+                id="extra-source",
+                final={**edge.sources[0].final, "relation": edge.relation},
+                assessment={"relation_retention": "generalized"},
+            )
+        ]
+        graph.edges.append(assess_edge(edge))
+        graph.validate()
+        graphs[f"train_{i}"] = graph
+    return graphs
+
+
+def test_shared_multigraph_training_resume_and_unseen_graph_inference(
+    toy_graph,
+    assessed_source,
+    tiny_encoder,
+    small_config,
+    recording_backend,
+    tmp_path,
+    monkeypatch,
+):
+    import copy
+    from dataclasses import replace
+
+    from qgraphrag import training as module
+
+    graphs = _training_graphs(toy_graph, assessed_source)
+    tensors = {name: tensorize(graph, tiny_encoder) for name, graph in graphs.items()}
+    backend = recording_backend(lambda *args: pytest.fail("Question-side entities are supplied"))
+    datasets = {}
+    for name, graph in graphs.items():
+        rows = [
+            {
+                "id": name + "-q" + str(i),
+                "question": question,
+                "question_entities": [entity],
+                "supporting_facts": supports,
+            }
+            for i, (question, entity, supports) in enumerate(
+                [
+                    ("Where was Ada Stone born?", "Ada Stone", ["d1", "d2"]),
+                    ("Where was Mira Vale born?", "Mira Vale", ["d3", "d4"]),
+                ]
+            )
+        ]
+        path = tmp_path / name / "train.json"
+        write_json(path, rows)
+        datasets[name] = prepare_queries(
+            path, graph, tiny_encoder, EntityLinker(graph, tiny_encoder, backend), tmp_path / name
+        )
+    config = copy.deepcopy(small_config)
+    config["pretrain"].update(epochs=1, steps_per_epoch=None)
+    config["finetune"].update(epochs=2, steps_per_epoch=None)
+    config["paths"]["output"] = str(tmp_path / "pretrain")
+    pretrain(config, tensors)
+    checkpoint = tmp_path / "pretrain/last.pt"
+    original_forward = module.QualityGNNRetriever.forward
+    calls = []
+
+    def forward(self, graph, *args, **kwargs):
+        calls.append((id(self), id(self.quality_encoder), graph.graph_fingerprint))
+        return original_forward(self, graph, *args, **kwargs)
+
+    monkeypatch.setattr(module.QualityGNNRetriever, "forward", forward)
+    original_initialize = module.initialize_from_pretrain
+    initialized = []
+
+    def initialize(*args):
+        initialized.append(True)
+        return original_initialize(*args)
+
+    monkeypatch.setattr(module, "initialize_from_pretrain", initialize)
+    config["paths"]["output"] = str(tmp_path / "full")
+    full = finetune(config, tensors, datasets, None, pretrained=checkpoint)
+    assert len(initialized) == 1
+    assert len({item[:2] for item in calls}) == 1
+    assert {item[2] for item in calls} == {g.graph_fingerprint for g in tensors.values()}
+    _, metadata = load_checkpoint(tmp_path / "full/last.pt", require_trained_quality=True)
+    assert set(metadata["graph_fingerprints"]) == set(graphs)
+    assert set(metadata["training_fingerprints"]) == set(graphs)
+    assert metadata["graph_fingerprint"] is None
+    assert max(float(state["step"]) for state in metadata["optimizer"]["state"].values()) == 8
+    logs = [
+        json.loads(line) for line in (tmp_path / "full/training.jsonl").read_text().splitlines()
+    ]
+    assert all(row["examples_by_graph"] == {name: 2 for name in graphs} for row in logs)
+    assert all(row["steps"] == 4 for row in logs)
+    monkeypatch.setattr(module.QualityGNNRetriever, "forward", original_forward)
+    config["paths"]["output"] = str(tmp_path / "resume")
+    config["finetune"]["epochs"] = 1
+    finetune(config, tensors, datasets, None, pretrained=checkpoint)
+    config["finetune"]["epochs"] = 2
+    continued = finetune(
+        config,
+        dict(reversed(list(tensors.items()))),
+        datasets,
+        None,
+        resume=tmp_path / "resume/last.pt",
+    )
+    for key, value in full.state_dict().items():
+        torch.testing.assert_close(value, continued.state_dict()[key], rtol=0, atol=0)
+    changed = dict(tensors)
+    changed["train_0"] = replace(tensors["train_0"], graph_fingerprint="changed-graph")
+    with pytest.raises(ValueError, match="Resume graph/training data mismatch"):
+        finetune(config, changed, datasets, None, resume=tmp_path / "resume/last.pt")
+    heldout = copy.deepcopy(graphs["train_3"])
+    heldout.entities = sorted(heldout.entities + ["unseen isolated entity"])
+    evaluation = tensorize(heldout, tiny_encoder)
+    model, _ = load_checkpoint(tmp_path / "full/last.pt", require_trained_quality=True)
+    model.eval()
+    seeds = torch.zeros(1, evaluation.num_nodes)
+    seeds[0, heldout.entities.index("ada stone")] = 1
+    with torch.inference_mode():
+        result = model(evaluation, tiny_encoder.encode(["Ada Stone"]), seeds)
+    assert result.logits.shape == (1, evaluation.num_nodes)
+    assert torch.isfinite(result.logits).all()
+    model.cache_gates(evaluation, tmp_path / "eval-gates.pt")
+    model.load_gate_cache(evaluation, tmp_path / "eval-gates.pt")
+    with pytest.raises(ValueError, match="does not match"):
+        model.load_gate_cache(tensors["train_0"], tmp_path / "eval-gates.pt")
+
+
+def test_cli_training_does_not_load_evaluation_graph(
+    toy_graph,
+    tiny_encoder,
+    small_config,
+    tmp_path,
+    monkeypatch,
+):
+    from pathlib import Path
+
+    import yaml
+
+    from qgraphrag import cli, training
+
+    config = small_config
+    config["datasets"].update(root=str(tmp_path / "data"), train_names=["a", "b"], eval_name="eval")
+    for name in ["a", "b"]:
+        toy_graph.save(Path(config["paths"]["index"]) / name)
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(config))
+    monkeypatch.setattr(cli, "_encoder", lambda config: tiny_encoder)
+    seen = []
+    monkeypatch.setattr(
+        training, "pretrain", lambda config, graphs, resume=None: seen.append(set(graphs))
+    )
+    main(["--config", str(path), "pretrain"])
+    assert seen == [{"a", "b"}]
+    assert not (Path(config["paths"]["index"]) / "eval").exists()
+
+
+def test_cli_inference_only_needs_evaluation_graph(toy_graph, small_config, tmp_path, monkeypatch):
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    import yaml
+
+    from qgraphrag import cli
+
+    config = small_config
+    config["datasets"].update(root=str(tmp_path / "data"), train_names=["a", "b"], eval_name="eval")
+    toy_graph.save(Path(config["paths"]["index"]) / "eval")
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(config))
+
+    def pipeline(config, graph, checkpoint):
+        assert Path(config["paths"]["index"]).name == "eval"
+        assert config["llm"]["model"] == "Qwen3-14B-AWQ"
+        return SimpleNamespace(answer=lambda question: {"answer": "test answer"})
+
+    monkeypatch.setattr(cli, "_pipeline", pipeline)
+    main(["--config", str(path), "ask", "--checkpoint", "unused.pt", "--question", "test"])
+    assert not (Path(config["paths"]["index"]) / "a").exists()
+
+
+def test_builder_override_does_not_change_query_side_configuration(
+    toy_graph,
+    small_config,
+    tmp_path,
+    recording_backend,
+    monkeypatch,
+):
+    from pathlib import Path
+
+    import yaml
+
+    from qgraphrag import cli, construction
+
+    config = small_config
+    config["datasets"].update(root=str(tmp_path / "data"), train_names=["a", "b"], eval_name="eval")
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(config))
+    monkeypatch.setattr(cli, "_backend", lambda config: recording_backend(lambda *args: {}))
+    built = []
+
+    def build(config, backend):
+        built.append((Path(config["paths"]["index"]).name, config["llm"]["model"]))
+        return toy_graph
+
+    monkeypatch.setattr(construction, "build_index", build)
+    main(["--config", str(path), "--set", "llm.model=Qwen3-8B", "build-index"])
+    assert built == [("a", "Qwen3-8B"), ("b", "Qwen3-8B"), ("eval", "Qwen3-8B")]
+    from qgraphrag.config import load_config
+
+    assert load_config(path)["llm"]["model"] == "Qwen3-14B-AWQ"

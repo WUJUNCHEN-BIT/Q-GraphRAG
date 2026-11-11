@@ -1,6 +1,7 @@
+datasets:
+  root: data/hotpotqa
+  train_names: [train_0, train_1, train_2, train_3]
+  eval_name: eval
 paths:
-  corpus: data/hotpotqa/raw/dataset_corpus.json
-  train: data/hotpotqa/raw/train.json
-  valid: null
-  index: artifacts/hotpotqa/index
+  index: artifacts/hotpotqa
   output: outputs/hotpotqa/run
